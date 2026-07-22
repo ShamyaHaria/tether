@@ -47,6 +47,29 @@ readable end to end rather than feature-complete.
   and computes the ASLR load bias from `/proc/<pid>/maps`, so you can enter
   addresses the way `objdump -d` prints them
 
+## Platform requirements
+
+Tether is Linux-only, on purpose: it's built directly on Linux's `ptrace`
+API (`PTRACE_GETREGS`/`SETREGS`, `PTRACE_O_TRACECLONE`), reads `/proc/<pid>/maps`,
+and parses ELF headers. None of that exists on macOS (Mach-O binaries, no
+`/proc`, a much more restricted `ptrace`) or Windows. If you're on macOS,
+the easiest fix is a real Linux environment via Docker, since Docker
+Desktop runs a Linux VM under the hood:
+
+```bash
+docker build -t tether-dev .
+docker run --rm -it --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    -v "$(pwd)":/work tether-dev bash
+# inside the container:
+make
+./bin/tether ./bin/simple_target
+```
+
+`--cap-add=SYS_PTRACE` and the unconfined seccomp profile are required
+because Docker's default container profile blocks `ptrace` outright. A
+Lima/UTM/multipass Linux VM, or a cloud dev box, works the same way and
+avoids the container flags entirely if you'd rather not touch seccomp.
+
 ## Build
 
 ```
