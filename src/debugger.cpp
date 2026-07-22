@@ -78,10 +78,12 @@ bool Debugger::launch() {
     threads_.insert(pid);
     process_alive_ = true;
     detectPieAndLoadBase();
+    loadSymbolTable();
 
     std::cout << "Launched pid " << pid << " (" << program_path_ << ")"
               << (is_pie_ ? " [PIE, load base 0x" : " [non-PIE base 0x")
-              << std::hex << load_base_ << std::dec << "]\n";
+              << std::hex << load_base_ << std::dec << "]"
+              << " [" << symbols_.size() << " symbols]\n";
     return true;
 }
 
@@ -112,9 +114,11 @@ bool Debugger::attach(pid_t pid) {
     }
 
     detectPieAndLoadBase();
+    loadSymbolTable();
     std::cout << "Attached to pid " << pid << " (" << program_path_ << ")"
               << (is_pie_ ? " [PIE, load base 0x" : " [non-PIE base 0x")
-              << std::hex << load_base_ << std::dec << "]\n";
+              << std::hex << load_base_ << std::dec << "]"
+              << " [" << symbols_.size() << " symbols]\n";
     return true;
 }
 
@@ -147,10 +151,79 @@ void Debugger::detectPieAndLoadBase() {
 }
 
 uint64_t Debugger::resolveAddress(const std::string& text) const {
-    std::string s = text;
-    if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) s = s.substr(2);
-    uint64_t off = std::stoull(s, nullptr, 16);
+    // An explicit "0x" prefix always means a raw address, never a symbol
+    // name -- this is the escape hatch for the rare symbol whose name is
+    // itself all hex digits.
+    if (text.rfind("0x", 0) == 0 || text.rfind("0X", 0) == 0) {
+        uint64_t off = std::stoull(text.substr(2), nullptr, 16);
+        return is_pie_ ? off + load_base_ : off;
+    }
+    // Otherwise, a known function name wins over a bare hex guess.
+    auto it = symbols_.find(text);
+    if (it != symbols_.end()) {
+        return is_pie_ ? it->second + load_base_ : it->second;
+    }
+    // Fall back to treating it as hex without the "0x" prefix, matching
+    // how objdump prints addresses.
+    uint64_t off = std::stoull(text, nullptr, 16);
     return is_pie_ ? off + load_base_ : off;
+}
+
+// Parses the ELF section header table looking for a symbol table --
+// .symtab if the binary still has one, otherwise .dynsym -- and builds a
+// name -> static address map. Addresses stored here are exactly what's in
+// the file (pre-ASLR); resolveAddress() adds the PIE load bias at lookup
+// time, the same way it already does for hand-typed addresses.
+void Debugger::loadSymbolTable() {
+    symbols_.clear();
+
+    std::ifstream f(program_path_, std::ios::binary);
+    if (!f) return;
+
+    Elf64_Ehdr ehdr{};
+    f.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr));
+    if (!f || memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) return;
+
+    std::vector<Elf64_Shdr> sections(ehdr.e_shnum);
+    f.seekg(ehdr.e_shoff);
+    f.read(reinterpret_cast<char*>(sections.data()),
+           static_cast<std::streamsize>(ehdr.e_shnum) * sizeof(Elf64_Shdr));
+    if (!f) return;
+
+    int symtab_idx = -1;
+    for (size_t i = 0; i < sections.size(); ++i) {
+        if (sections[i].sh_type == SHT_SYMTAB) { symtab_idx = static_cast<int>(i); break; }
+    }
+    if (symtab_idx < 0) {
+        for (size_t i = 0; i < sections.size(); ++i) {
+            if (sections[i].sh_type == SHT_DYNSYM) { symtab_idx = static_cast<int>(i); break; }
+        }
+    }
+    if (symtab_idx < 0) return; // no symbol table at all (fully stripped)
+
+    const Elf64_Shdr& symtab = sections[symtab_idx];
+    const Elf64_Shdr& strtab = sections[symtab.sh_link]; // sh_link -> matching string table
+
+    size_t sym_count = symtab.sh_size / sizeof(Elf64_Sym);
+    std::vector<Elf64_Sym> syms(sym_count);
+    f.seekg(symtab.sh_offset);
+    f.read(reinterpret_cast<char*>(syms.data()),
+           static_cast<std::streamsize>(sym_count) * sizeof(Elf64_Sym));
+    if (!f) return;
+
+    std::vector<char> strs(strtab.sh_size);
+    f.seekg(strtab.sh_offset);
+    f.read(strs.data(), static_cast<std::streamsize>(strtab.sh_size));
+    if (!f) return;
+
+    for (const auto& sym : syms) {
+        if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC) continue; // functions only
+        if (sym.st_shndx == SHN_UNDEF) continue;               // skip imports/externs
+        if (sym.st_name == 0 || sym.st_name >= strtab.sh_size) continue;
+        std::string name(&strs[sym.st_name]);
+        if (name.empty()) continue;
+        symbols_[name] = sym.st_value;
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -337,11 +410,12 @@ void Debugger::printHelp() const {
         "commands:\n"
         "  continue | c              resume the focus thread\n"
         "  step | s                  single-step one instruction\n"
-        "  break | b <addr>          set a breakpoint (hex address)\n"
-        "  delete | d <addr>         remove a breakpoint\n"
+        "  break | b <addr|name>     set a breakpoint (hex address or function name)\n"
+        "  delete | d <addr|name>    remove a breakpoint\n"
         "  regs | r                  print registers of the focus thread\n"
-        "  examine | x <addr> [n]    dump n 8-byte words starting at addr (default 4)\n"
+        "  examine | x <addr|name> [n]  dump n 8-byte words starting there (default 4)\n"
         "  threads | t               list tracked thread ids\n"
+        "  symbols | y [filter]      list known function symbols, optionally filtered\n"
         "  help | h                  show this message\n"
         "  quit | q                  detach/kill and exit\n";
 }
@@ -482,6 +556,24 @@ void Debugger::cmdThreads() {
     }
 }
 
+void Debugger::cmdSymbols(const std::string& arg) {
+    if (symbols_.empty()) {
+        std::cout << "no symbols loaded (binary may be stripped)\n";
+        return;
+    }
+    size_t shown = 0;
+    for (const auto& [name, addr] : symbols_) {
+        if (!arg.empty() && name.find(arg) == std::string::npos) continue;
+        uint64_t runtime = is_pie_ ? addr + load_base_ : addr;
+        std::cout << "  0x" << std::hex << runtime << std::dec << "  " << name << "\n";
+        if (++shown >= 50) {
+            std::cout << "  ... (" << symbols_.size() - shown << " more, narrow with a filter)\n";
+            break;
+        }
+    }
+    if (shown == 0) std::cout << "no symbols match '" << arg << "'\n";
+}
+
 void Debugger::handleCommand(const std::string& line) {
     auto tokens = split(line);
     if (tokens.empty()) return;
@@ -502,6 +594,8 @@ void Debugger::handleCommand(const std::string& line) {
         cmdExamine(arg);
     } else if (cmd == "threads" || cmd == "t") {
         cmdThreads();
+    } else if (cmd == "symbols" || cmd == "y") {
+        cmdSymbols(arg);
     } else if (cmd == "help" || cmd == "h") {
         printHelp();
     } else if (cmd == "quit" || cmd == "q") {

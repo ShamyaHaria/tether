@@ -55,6 +55,7 @@ private:
     uint64_t load_base_ = 0; // runtime load bias for PIE binaries, else 0
 
     std::map<uint64_t, Breakpoint> breakpoints_; // keyed by runtime address
+    std::map<std::string, uint64_t> symbols_;    // function name -> static (unbiased) address
 
     // -- command dispatch --
     void handleCommand(const std::string& line);
@@ -65,10 +66,12 @@ private:
     void cmdRegs(const std::string& arg);
     void cmdExamine(const std::string& arg);
     void cmdThreads();
+    void cmdSymbols(const std::string& arg);
     void printHelp() const;
 
     // -- ptrace / process plumbing --
     void detectPieAndLoadBase();
+    void loadSymbolTable();
     uint64_t resolveAddress(const std::string& text) const;
 
     void enableBreakpoint(Breakpoint& bp);
