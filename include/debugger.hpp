@@ -1,18 +1,25 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
 #include <sys/types.h>
 
+// A single software breakpoint. `original_data` holds the 8-byte word that
+// used to live at `address` before we overwrote its low byte with 0xCC
+// (INT3), so we can restore it later.
+struct Breakpoint {
+    uint64_t address = 0;
+    long original_data = 0;
+    bool enabled = false;
+};
+
 // Tether: a small ptrace-based debugger for Linux processes.
 //
-// This first slice only handles getting a tracee under control: launching
-// a fresh process (fork + PTRACE_TRACEME + execve) or attaching to one
-// that's already running, plus figuring out its PIE load bias so future
-// address-based commands (breakpoints, memory reads) can work against the
-// addresses objdump reports rather than raw runtime addresses.
+// This slice adds breakpoints, register inspection, and memory reads on
+// top of the process-control layer from the previous commit.
 class Debugger {
 public:
     Debugger(std::string program_path, std::vector<std::string> program_args);
@@ -32,15 +39,33 @@ private:
     std::vector<std::string> program_args_;
 
     pid_t main_pid_ = -1;
+    pid_t focus_tid_ = -1;  // the thread currently reported at the REPL prompt
     std::set<pid_t> threads_;
     bool process_alive_ = false;
 
     bool is_pie_ = false;
     uint64_t load_base_ = 0; // runtime load bias for PIE binaries, else 0
 
+    std::map<uint64_t, Breakpoint> breakpoints_; // keyed by runtime address
+
     void detectPieAndLoadBase();
     uint64_t resolveAddress(const std::string& text) const;
 
     void handleCommand(const std::string& line);
     void printHelp() const;
+
+    void cmdContinue();
+    void cmdBreak(const std::string& arg);
+    void cmdDelete(const std::string& arg);
+    void cmdRegs(const std::string& arg);
+    void cmdExamine(const std::string& arg);
+
+    void enableBreakpoint(Breakpoint& bp);
+    void disableBreakpoint(Breakpoint& bp);
+    void stepOverBreakpointIfNeeded(pid_t tid);
+
+    uint64_t getPC(pid_t tid) const;
+    void setPC(pid_t tid, uint64_t pc);
+    void printRegisters(pid_t tid) const;
+    void printExit(pid_t tid, int status) const;
 };
