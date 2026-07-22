@@ -249,13 +249,14 @@ void Debugger::printHelp() const {
     std::cout <<
         "commands:\n"
         "  continue | c              resume the focus thread\n"
+        "  step | s                  single-step one instruction\n"
         "  break | b <addr>          set a breakpoint (hex address)\n"
         "  delete | d <addr>         remove a breakpoint\n"
         "  regs | r                  print registers of the focus thread\n"
         "  examine | x <addr> [n]    dump n 8-byte words starting at addr (default 4)\n"
         "  help | h                  show this message\n"
         "  quit | q                  detach/kill and exit\n"
-        "(single-step and multithreading land in upcoming commits)\n";
+        "(multithreaded tracing lands in an upcoming commit)\n";
 }
 
 void Debugger::cmdContinue() {
@@ -293,6 +294,32 @@ void Debugger::cmdContinue() {
                       << " (thread " << focus_tid_ << ")\n";
         }
     }
+}
+
+void Debugger::cmdStep() {
+    if (!process_alive_) {
+        std::cout << "no process running\n";
+        return;
+    }
+    uint64_t pc = getPC(focus_tid_);
+    auto it = breakpoints_.find(pc);
+    bool had_bp = (it != breakpoints_.end() && it->second.enabled);
+    if (had_bp) disableBreakpoint(it->second);
+
+    ptrace(PTRACE_SINGLESTEP, focus_tid_, nullptr, nullptr);
+    int status = 0;
+    waitpid(focus_tid_, &status, 0);
+
+    if (WIFEXITED(status) || WIFSIGNALED(status)) {
+        threads_.erase(focus_tid_);
+        process_alive_ = false;
+        printExit(focus_tid_, status);
+        return;
+    }
+    if (had_bp) enableBreakpoint(it->second);
+
+    std::cout << "stepped to 0x" << std::hex << getPC(focus_tid_) << std::dec
+              << " (thread " << focus_tid_ << ")\n";
 }
 
 void Debugger::cmdBreak(const std::string& arg) {
@@ -395,6 +422,8 @@ void Debugger::handleCommand(const std::string& line) {
 
     if (cmd == "continue" || cmd == "c") {
         cmdContinue();
+    } else if (cmd == "step" || cmd == "s") {
+        cmdStep();
     } else if (cmd == "break" || cmd == "b") {
         cmdBreak(arg);
     } else if (cmd == "delete" || cmd == "d") {

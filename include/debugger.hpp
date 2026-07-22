@@ -55,6 +55,7 @@ private:
     void printHelp() const;
 
     void cmdContinue();
+    void cmdStep();
     void cmdBreak(const std::string& arg);
     void cmdDelete(const std::string& arg);
     void cmdRegs(const std::string& arg);
