@@ -13,6 +13,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+namespace {
+
+std::vector<std::string> split(const std::string& line) {
+    std::istringstream iss(line);
+    std::vector<std::string> tokens;
+    std::string tok;
+    while (iss >> tok) tokens.push_back(tok);
+    return tokens;
+}
+
+} // namespace
+
 Debugger::Debugger(std::string program_path, std::vector<std::string> program_args)
     : program_path_(std::move(program_path)), program_args_(std::move(program_args)) {}
 
@@ -60,6 +72,9 @@ bool Debugger::launch() {
         return false;
     }
 
+    // Auto-attach cloned threads; kill the tracee if we ourselves die.
+    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACECLONE | PTRACE_O_EXITKILL);
+
     threads_.insert(pid);
     process_alive_ = true;
     detectPieAndLoadBase();
@@ -80,6 +95,7 @@ bool Debugger::attach(pid_t pid) {
         perror("waitpid");
         return false;
     }
+    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACECLONE);
 
     main_pid_ = pid;
     focus_tid_ = pid;
@@ -180,23 +196,15 @@ void Debugger::printRegisters(pid_t tid) const {
                << "   eflags " << hx(regs.eflags) << "\n";
 }
 
-void Debugger::printExit(pid_t tid, int status) const {
-    if (WIFEXITED(status)) {
-        std::cout << "[thread " << tid << "] exited with status " << WEXITSTATUS(status) << "\n";
-    } else if (WIFSIGNALED(status)) {
-        std::cout << "[thread " << tid << "] killed by signal " << WTERMSIG(status) << "\n";
-    }
-}
-
 // ---------------------------------------------------------------------
 // breakpoints
 // ---------------------------------------------------------------------
-//
-// NOTE: PTRACE_PEEKTEXT/POKETEXT require their target *tid* to currently be
-// in a ptrace-stop. focus_tid_ is always the thread guaranteed to be
-// stopped whenever the REPL has control, so memory ops target that rather
-// than main_pid_ (which matters once multiple threads are in the picture).
 
+// NOTE: PTRACE_PEEKTEXT/POKETEXT require their target *tid* to currently be
+// in a ptrace-stop. All threads in a process share one address space, so
+// any currently-stopped thread will do -- it need not be the thread-group
+// leader. focus_tid_ is always the (one) thread guaranteed to be stopped
+// whenever the REPL has control, so we use that rather than main_pid_.
 void Debugger::enableBreakpoint(Breakpoint& bp) {
     errno = 0;
     long orig = ptrace(PTRACE_PEEKTEXT, focus_tid_, reinterpret_cast<void*>(bp.address), nullptr);
@@ -242,6 +250,85 @@ void Debugger::stepOverBreakpointIfNeeded(pid_t tid) {
 }
 
 // ---------------------------------------------------------------------
+// event loop
+// ---------------------------------------------------------------------
+
+void Debugger::printExit(pid_t tid, int status) const {
+    if (WIFEXITED(status)) {
+        std::cout << "[thread " << tid << "] exited with status " << WEXITSTATUS(status) << "\n";
+    } else if (WIFSIGNALED(status)) {
+        std::cout << "[thread " << tid << "] killed by signal " << WTERMSIG(status) << "\n";
+    }
+}
+
+void Debugger::runEventLoopUntilStopOrExit() {
+    while (true) {
+        int status = 0;
+        pid_t wpid = waitpid(-1, &status, __WALL);
+        if (wpid < 0) {
+            if (errno == ECHILD) {
+                process_alive_ = false;
+                std::cout << "process has no more tracked threads\n";
+            }
+            return;
+        }
+
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            threads_.erase(wpid);
+            printExit(wpid, status);
+            if (wpid == main_pid_ || threads_.empty()) {
+                process_alive_ = false;
+                return;
+            }
+            continue; // a non-leader thread exited; keep waiting
+        }
+
+        if (!WIFSTOPPED(status)) continue;
+
+        bool first_sighting = threads_.insert(wpid).second;
+        if (first_sighting && wpid != main_pid_) {
+            // Initial auto-attach stop for a freshly cloned thread
+            // (PTRACE_O_TRACECLONE). Let it run; it now shares every
+            // breakpoint already installed in the address space.
+            std::cout << "[new thread " << wpid << "] attached\n";
+            ptrace(PTRACE_CONT, wpid, nullptr, nullptr);
+            continue;
+        }
+
+        int sig = WSTOPSIG(status);
+        int event = status >> 16;
+
+        if (sig == SIGTRAP && event == PTRACE_EVENT_CLONE) {
+            // The cloning thread itself just trapped on the clone() call;
+            // the new child's own stop arrives as a separate wait event.
+            ptrace(PTRACE_CONT, wpid, nullptr, nullptr);
+            continue;
+        }
+
+        if (sig == SIGTRAP) {
+            uint64_t pc = getPC(wpid);
+            uint64_t maybe_bp = pc - 1;
+            auto it = breakpoints_.find(maybe_bp);
+            if (it != breakpoints_.end() && it->second.enabled) {
+                setPC(wpid, maybe_bp);
+                focus_tid_ = wpid;
+                std::cout << "Breakpoint hit at 0x" << std::hex << maybe_bp << std::dec
+                          << " (thread " << wpid << ")\n";
+                return;
+            }
+            // Stray trap on a thread we're not deliberately stepping; just
+            // let it continue.
+            ptrace(PTRACE_CONT, wpid, nullptr, nullptr);
+            continue;
+        }
+
+        // Some other signal was delivered to the tracee; forward it and
+        // keep going.
+        ptrace(PTRACE_CONT, wpid, nullptr, reinterpret_cast<void*>(sig));
+    }
+}
+
+// ---------------------------------------------------------------------
 // REPL
 // ---------------------------------------------------------------------
 
@@ -254,15 +341,12 @@ void Debugger::printHelp() const {
         "  delete | d <addr>         remove a breakpoint\n"
         "  regs | r                  print registers of the focus thread\n"
         "  examine | x <addr> [n]    dump n 8-byte words starting at addr (default 4)\n"
+        "  threads | t               list tracked thread ids\n"
         "  help | h                  show this message\n"
-        "  quit | q                  detach/kill and exit\n"
-        "(multithreaded tracing lands in an upcoming commit)\n";
+        "  quit | q                  detach/kill and exit\n";
 }
 
 void Debugger::cmdContinue() {
-    // Single-thread version for now: this only waits on focus_tid_ directly.
-    // Multithreaded tracing (waitpid(-1, ..., __WALL) across every tracked
-    // thread) is added in a later commit.
     if (!process_alive_) {
         std::cout << "no process running\n";
         return;
@@ -273,27 +357,7 @@ void Debugger::cmdContinue() {
         perror("PTRACE_CONT");
         return;
     }
-
-    int status = 0;
-    if (waitpid(focus_tid_, &status, 0) < 0) {
-        perror("waitpid");
-        return;
-    }
-    if (WIFEXITED(status) || WIFSIGNALED(status)) {
-        process_alive_ = false;
-        printExit(focus_tid_, status);
-        return;
-    }
-    if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
-        uint64_t pc = getPC(focus_tid_);
-        uint64_t maybe_bp = pc - 1;
-        auto it = breakpoints_.find(maybe_bp);
-        if (it != breakpoints_.end() && it->second.enabled) {
-            setPC(focus_tid_, maybe_bp);
-            std::cout << "Breakpoint hit at 0x" << std::hex << maybe_bp << std::dec
-                      << " (thread " << focus_tid_ << ")\n";
-        }
-    }
+    runEventLoopUntilStopOrExit();
 }
 
 void Debugger::cmdStep() {
@@ -410,15 +474,19 @@ void Debugger::cmdExamine(const std::string& arg) {
     }
 }
 
+void Debugger::cmdThreads() {
+    std::cout << "tracked threads (" << threads_.size() << "):\n";
+    for (pid_t t : threads_) {
+        std::cout << "  " << t << (t == main_pid_ ? " (main)" : "")
+                   << (t == focus_tid_ ? " <- focus" : "") << "\n";
+    }
+}
+
 void Debugger::handleCommand(const std::string& line) {
-    std::istringstream iss(line);
-    std::string cmd;
-    iss >> cmd;
-    if (cmd.empty()) return;
-    std::string arg;
-    std::getline(iss, arg);
-    // trim a single leading space left over from the >> extraction
-    if (!arg.empty() && arg.front() == ' ') arg.erase(0, 1);
+    auto tokens = split(line);
+    if (tokens.empty()) return;
+    const std::string& cmd = tokens[0];
+    std::string arg = (tokens.size() > 1) ? line.substr(line.find(tokens[1])) : "";
 
     if (cmd == "continue" || cmd == "c") {
         cmdContinue();
@@ -432,10 +500,14 @@ void Debugger::handleCommand(const std::string& line) {
         cmdRegs(arg);
     } else if (cmd == "examine" || cmd == "x") {
         cmdExamine(arg);
+    } else if (cmd == "threads" || cmd == "t") {
+        cmdThreads();
     } else if (cmd == "help" || cmd == "h") {
         printHelp();
     } else if (cmd == "quit" || cmd == "q") {
-        if (process_alive_) ptrace(PTRACE_KILL, main_pid_, nullptr, nullptr);
+        if (process_alive_) {
+            ptrace(PTRACE_KILL, main_pid_, nullptr, nullptr);
+        }
         process_alive_ = false;
     } else {
         std::cout << "unknown command '" << cmd << "' (try 'help')\n";
